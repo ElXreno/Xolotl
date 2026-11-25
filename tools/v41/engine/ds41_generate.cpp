@@ -77,6 +77,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -2272,6 +2273,12 @@ int main(int argc, char ** argv) {
             } catch (...) { std::fprintf(stderr, "serve: persistent prefix save skipped (host allocation)\n"); }
         };
         std::vector<uint64_t> live_id;   // hist's position identities (its prompt part; past it: text = 0)
+        std::map<int64_t, std::string> pool_identity;
+        auto note_pool_identity = [&](int64_t id, const std::string & identity) {
+            if (id == 0) return;
+            pool_identity.emplace(id, identity);
+            while (pool_identity.size() > 1024) pool_identity.erase(pool_identity.begin());
+        };
         // the live conversation's turn boundary into the pool (logged as serve/server.py ConvCacheLog reads it)
         auto save_live = [&](const char * why) {
             if (!pool_on || snap_len < std::max(1, park_min) || hist.size() < (size_t) snap_len) return;
@@ -2279,6 +2286,7 @@ int main(int argc, char ** argv) {
             std::string perr;
             const int64_t id = pool.save(dense, hist.data(), live_id.data(), live_id.size(), snap_len,
                                          snap_logits.empty() ? nullptr : snap_logits.data(), snap_logits.size(), perr);
+            note_pool_identity(id, live_prefix_identity);
             std::fprintf(stderr, "strata serve: conversation cache: %s %d tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu (%s%s%s)\n",
                          id ? "parked" : "skipped", snap_len, now_ms() - t0, pool.size(), pool.bytes(), pool.evictions(), why,
                          id ? "" : ": ", id ? "" : perr.c_str());
@@ -2482,6 +2490,7 @@ int main(int argc, char ** argv) {
             std::string perr;
             const int64_t id = pool.save(dense, c.hist.data(), c.live_id.data(), c.live_id.size(), c.snap_len,
                                          c.snap_logits.empty() ? nullptr : c.snap_logits.data(), c.snap_logits.size(), perr);
+            note_pool_identity(id, c.persistent_identity);
             std::fprintf(stderr, "strata serve: conversation cache: %s %d tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu (%s, slot %d%s%s)\n",
                          id ? "parked" : "skipped", c.snap_len, now_ms() - t0, pool.size(), pool.bytes(), pool.evictions(), why,
                          s, id ? "" : ": ", id ? "" : perr.c_str());
@@ -3274,7 +3283,11 @@ int main(int argc, char ** argv) {
                         live_id.assign(rid.begin(), rid.begin() + std::min<size_t>(rid.size(), (size_t) pr));
                         if (pr == rs.pos) { snap_len = (int) rs.pos; snap_logits = rs.logits; }
                         else snap_len = -1;
-                        live_prefix_identity.clear(); // RAM records predate computation identities
+                        {
+                            const auto known = pool_identity.find(m.rec);
+                            if (known != pool_identity.end()) live_prefix_identity = known->second;
+                            else live_prefix_identity.clear();
+                        }
                         snap_seed_n = 0;   // no DSpark seed rows in a record: a repeat decodes its first tokens draftless
                         live_dirty = false;
                         reuse_override = (int) pr;
@@ -3932,6 +3945,8 @@ int main(int argc, char ** argv) {
                     if (dense.snapshot(pfx))
                         id = pool.save(dense, ids.data(), rid.data(), std::min<size_t>(rid.size(), (size_t) pfx), pfx, nullptr, 0, perr);
                     else perr = "snapshot failed";
+                    note_pool_identity(id, reused == 0 || live_prefix_identity == request_prefix_identity
+                                               ? request_prefix_identity : std::string());
                     std::string ferr3;   // the rest of the read writes the spare compressor row the save copies
                     if (!pool.fence(&ferr3)) std::fprintf(stderr, "strata serve: conversation cache: fence: %s\n", ferr3.c_str());
                     std::fprintf(stderr, "strata serve: conversation cache: %s %d tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu (prefix%s%s)\n",
