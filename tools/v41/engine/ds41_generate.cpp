@@ -2245,10 +2245,20 @@ int main(int argc, char ** argv) {
                 if (command == "STOP" || (slot >= 0 && command == "BSTOP " + std::to_string(slot))) return true;
             return false;
         };
+        auto turn_end_cancelled = [&](int slot) {
+            std::lock_guard<std::mutex> guard(qm);
+            bool later = false;
+            for (const auto & command : q) {
+                const bool stop = command == "STOP" || (slot >= 0 && command == "BSTOP " + std::to_string(slot));
+                if (stop && later) return true;
+                if (!stop && !command.empty()) later = true;
+            }
+            return false;
+        };
         auto persistent_save = [&](const std::string & identity, const std::vector<int> & tokens,
                                    const std::vector<uint64_t> & images, int boundary,
                                    const std::vector<float> & logits, const std::vector<float> & seed, int seed_rows, int slot) {
-            auto cancelled = [&] { return persistent_cancelled(slot); };
+            auto cancelled = [&] { return turn_end_cancelled(slot); };
             if (identity.empty() || boundary < std::max(1, park_min) || tokens.size() < (size_t) boundary || cancelled()) return;
             try {
                 Ds41PersistentBoundary state;
