@@ -2220,6 +2220,39 @@ int main(int argc, char ** argv) {
         }
         if (persistent_prefix.enabled() && persistent_base.empty())
             std::fprintf(stderr, "serve: persistent prefix unavailable: requires a single-stage conversation pool and valid immutable input/runtime identity\n");
+        const int persistent_gap = [] {
+            const char * e = std::getenv("STRATA_PREFIX_CACHE_SAVE_GAP");
+            return e ? std::max(0, std::atoi(e)) : 16384;
+        }();
+        struct SavedPrefix { std::string identity; size_t cells; uint64_t hash; };
+        std::vector<SavedPrefix> saved_prefixes;
+        auto cells_hash = [](const uint64_t * cells, size_t n) {
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < n; ++i) { h ^= cells[i]; h *= 1099511628211ull; h ^= h >> 29; }
+            return h;
+        };
+        auto base_identity = [](const std::string & identity) {
+            const auto at = identity.find("/anchor-replay/");
+            return at == std::string::npos ? identity : identity.substr(0, at);
+        };
+        auto saved_mark = [&](const std::string & identity, const std::vector<uint64_t> & cells) {
+            return SavedPrefix{ base_identity(identity), cells.size(), cells_hash(cells.data(), cells.size()) };
+        };
+        auto remember_saved = [&](SavedPrefix mark) {
+            if (mark.identity.empty() || mark.cells == 0) return;
+            saved_prefixes.push_back(std::move(mark));
+            if (saved_prefixes.size() > 32) saved_prefixes.erase(saved_prefixes.begin());
+        };
+        auto saved_upto = [&](const std::string & identity, const std::vector<uint64_t> & cells) -> size_t {
+            const std::string base = base_identity(identity);
+            size_t best = 0;
+            for (const auto & s : saved_prefixes)
+                if (s.cells > best && s.cells <= cells.size() && s.identity == base && cells_hash(cells.data(), s.cells) == s.hash)
+                    best = s.cells;
+            return best;
+        };
+        if (persistent_prefix.enabled() && !persistent_base.empty())
+            std::fprintf(stderr, "serve: persistent prefix save gap %d tokens (STRATA_PREFIX_CACHE_SAVE_GAP)\n", persistent_gap);
         struct PrefixPending {
             // Destroy host bytes before releasing their queue reservation.
             std::shared_ptr<void> reservation;
@@ -2232,8 +2265,10 @@ int main(int argc, char ** argv) {
             if (committed) for (auto & image : pending) {
                 try {
                     const auto tokens = image.cells.size() / 2;
+                    auto mark = saved_mark(image.identity, image.cells);
                     const bool queued = persistent_prefix.enqueue_reserved(std::move(image.identity), std::move(image.cells),
                                                                            std::move(image.payload), std::move(image.reservation));
+                    if (queued) remember_saved(std::move(mark));
                     std::fprintf(stderr, "serve: persistent prefix anchor tokens=%zu queued=%d\n", tokens, queued ? 1 : 0);
                 } catch (...) { std::fprintf(stderr, "serve: persistent prefix anchor skipped (host allocation)\n"); }
             }
@@ -2257,10 +2292,19 @@ int main(int argc, char ** argv) {
         };
         auto persistent_save = [&](const std::string & identity, const std::vector<int> & tokens,
                                    const std::vector<uint64_t> & images, int boundary,
-                                   const std::vector<float> & logits, const std::vector<float> & seed, int seed_rows, int slot) {
+                                   const std::vector<float> & logits, const std::vector<float> & seed, int seed_rows, int slot,
+                                   bool force = false) {
             auto cancelled = [&] { return turn_end_cancelled(slot); };
             if (identity.empty() || boundary < std::max(1, park_min) || tokens.size() < (size_t) boundary || cancelled()) return;
             try {
+                auto cells = ds41_persistent_cells(tokens, images, boundary);
+                const size_t done = saved_upto(identity, cells);
+                if (done == cells.size()) return;
+                if (!force && persistent_gap > 0 && done > 0 && cells.size() - done < (size_t) persistent_gap * 2) {
+                    std::fprintf(stderr, "serve: persistent prefix save deferred tokens=%d saved=%zu gap=%d\n",
+                                 boundary, done / 2, persistent_gap);
+                    return;
+                }
                 Ds41PersistentBoundary state;
                 state.pos = boundary; state.logits = logits; state.seed_rows = seed_rows;
                 const size_t seed_count = (size_t) std::max(0, seed_rows) * 3 * (size_t) dense.geom().n_embd;
@@ -2276,10 +2320,13 @@ int main(int argc, char ** argv) {
                 core::prefix::CaptureTrace trace("ds41","completed",slot);
                 auto capture_cancelled = [&] { return trace.cancelled(cancelled()); };
                 if (!ds41_capture_persistent(dense, state, payload, error, capture_cancelled) || capture_cancelled()) return;
-                const bool queued = persistent_prefix.enqueue_reserved(identity, ds41_persistent_cells(tokens, images, boundary),
+                auto mark = saved_mark(identity, cells);
+                const bool queued = persistent_prefix.enqueue_reserved(identity, std::move(cells),
                                                                         std::move(payload), std::move(reservation));
+                if (queued) remember_saved(std::move(mark));
                 trace.finish(queued ? "enqueued" : "dropped");
-                std::fprintf(stderr, "serve: persistent prefix save tokens=%d queued=%d\n", boundary, queued ? 1 : 0);
+                std::fprintf(stderr, "serve: persistent prefix save tokens=%d queued=%d%s\n", boundary, queued ? 1 : 0,
+                             force ? " (shutdown)" : "");
             } catch (...) { std::fprintf(stderr, "serve: persistent prefix save skipped (host allocation)\n"); }
         };
         std::vector<uint64_t> live_id;   // hist's position identities (its prompt part; past it: text = 0)
@@ -3231,6 +3278,7 @@ int main(int argc, char ** argv) {
                             std::fprintf(stderr, "serve: persistent prefix restored=%lld new=%zu replay=%lld io_ms=%.3f\n",
                                          (long long) state.pos, ids.size() - (size_t) state.pos,
                                          (long long) (disk_replay ? ER : 0), now_ms() - start);
+                            remember_saved(saved_mark(request_prefix_identity, disk->cells));
                         } else std::fprintf(stderr, "serve: persistent prefix miss (%s)\n", error.c_str());
                     }
                 } catch (...) { std::fprintf(stderr, "serve: persistent prefix miss (host allocation)\n"); }
@@ -3707,7 +3755,8 @@ int main(int argc, char ** argv) {
                     auto cancelled = [&] { return prefill_cancelled ||
                         (my_slot >= 0 && bs[(size_t) my_slot].stop) || persistent_cancelled(my_slot); };
                     if (boundary >= total || boundary < std::max(8192, park_min) ||
-                        boundary - last_prefix_anchor < 8192 || request_prefix_pending.size() >= 64 || cancelled()) return;
+                        boundary - last_prefix_anchor < std::max(8192, persistent_gap) || request_prefix_pending.size() >= 64 ||
+                        cancelled()) return;
                     try {
                         uint64_t estimate = 48 + (uint64_t) nv * 4;
                         for (const auto & region : dense.state_regions(boundary)) estimate += region.bytes + 88;
@@ -4616,6 +4665,8 @@ int main(int argc, char ** argv) {
                 persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, my_slot);
             }
         }
+        if (NS == 0 && snap_len > 0 && hist.size() >= (size_t) snap_len)
+            persistent_save(live_prefix_identity, hist, live_id, snap_len, snap_logits, snap_seed, snap_seed_n, -1, true);
         persistent_prefix.flush();
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
