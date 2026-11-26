@@ -10136,6 +10136,8 @@ def make_handler(svc: Service):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
+            if svc.web_search:
+                req = websearch.nested_prompt(req, svc.web_search)
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
@@ -10144,6 +10146,9 @@ def make_handler(svc: Service):
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
+            if svc.web_search and (swapped := websearch.nested_prompt(req, svc.web_search)) is not req:
+                req = swapped
+                print("[strata] web_search: Claude Code's search prompt replaced", flush=True)
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             callable_tools, deferred = anthropic_tools(req)

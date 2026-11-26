@@ -6,7 +6,9 @@ results as the tool's answer and lets it continue; the client sees the call as a
 results as a web_search_tool_result block, as from Anthropic's own API (Claude Code's WebSearch reads those).
 
 The run config's `"web_search"` block: {"searxng": "http://127.0.0.1:8888", "max_results": 10, "timeout_s": 15,
-"max_uses": 8}.  Without it the tool is offered as before: a call the client has to answer itself."""
+"max_uses": 8, "nested_prompt": true}.  Without it the tool is offered as before: a call the client has to answer
+itself.  `nested_prompt` replaces the system prompt of Claude Code's WebSearch request (one search, a brief summary)
+with NESTED_PROMPT (several searches, a digest with sources)."""
 from __future__ import annotations
 
 import base64
@@ -16,11 +18,26 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULTS = {"max_results": 10, "timeout_s": 15.0, "max_uses": 8}
+DEFAULTS = {"max_results": 10, "timeout_s": 15.0, "max_uses": 8, "nested_prompt": True}
 DESCRIPTION = ("Search the web. Returns the title, URL and a snippet of each result. Use it for current events, "
                "recent releases and anything past your training data.")
 SCHEMA = {"type": "object", "properties": {"query": {"type": "string", "description": "The search query."}},
           "required": ["query"]}
+CLAUDE_CODE_SEARCH = "You run a web search for another Claude model"
+NESTED_PROMPT = (
+    "You run web searches for another model, which is waiting on your answer. It sees only the titles and URLs of "
+    "the results and what you write; the snippets reach only you, so your answer is all it learns from them.\n\n"
+    "Research the query thoroughly before answering:\n"
+    "- Start with the query as given. When the results miss part of the question, are off topic or thin, search "
+    "again: rephrase it, make it narrower or broader, use exact names, versions and error messages.\n"
+    "- When the needed results are still missing, search in other languages: English first, then the language of "
+    "the people most likely to write about the topic (for example Chinese for Chinese hardware, firmware, vendors "
+    "or apps; Japanese, Korean, German or Russian for their own). Translate the key terms, not the whole sentence.\n"
+    "- Search at most {uses} times. Stop earlier once new searches stop bringing new relevant results.\n\n"
+    "Then answer with a detailed digest for the other model, in the language of the query: every relevant fact, "
+    "figure, version, date and name the snippets give, translated when the source is in another language, each "
+    "followed by the URL it came from, the most relevant first. Say what you did not find and where sources "
+    "disagree. Do not add claims the results do not support.")
 
 
 def is_server_tool(tool) -> bool:
@@ -47,9 +64,34 @@ def settings_from(cfg: dict) -> dict | None:
             if not number or value != int(value) or value < 1:
                 raise SystemExit(f"[strata] config web_search.{key}={value!r}: expected a positive integer")
             out[key] = int(value)
+        elif key == "nested_prompt":
+            if not isinstance(value, bool):
+                raise SystemExit(f"[strata] config web_search.{key}={value!r}: expected true or false")
+            out[key] = value
         else:
             print(f"[strata] config web_search.{key}={value!r}: unknown key, ignored", flush=True)
     return out
+
+
+def nested_prompt(req: dict, settings: dict) -> dict:
+    specs = [t for t in req.get("tools") or [] if is_server_tool(t)]
+    if not settings.get("nested_prompt") or not specs:
+        return req
+    uses = settings["max_uses"]
+    for t in specs:
+        value = t.get("max_uses")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            uses = min(uses, value)
+    prompt = NESTED_PROMPT.format(uses=uses)
+    system = req.get("system")
+    if isinstance(system, str) and CLAUDE_CODE_SEARCH in system:
+        return {**req, "system": prompt}
+    if not isinstance(system, list):
+        return req
+    blocks = [{**b, "text": prompt}
+              if isinstance(b, dict) and b.get("type") == "text" and CLAUDE_CODE_SEARCH in str(b.get("text", ""))
+              else b for b in system]
+    return {**req, "system": blocks} if blocks != system else req
 
 
 def _host_matches(url: str, domains) -> bool:

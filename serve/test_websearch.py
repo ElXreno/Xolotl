@@ -31,6 +31,9 @@ RESULTS = [
     {"url": "https://docs.example.net/guide", "title": "Guide", "content": ""},
 ]
 WEB_SEARCH = {"type": "web_search_20250305", "name": "web_search"}
+CLAUDE_CODE_PROMPT = ("You run a web search for another Claude model, which is waiting on the result and can search "
+                      "again. Search once, then reply with a brief summary of the results.")
+SETTINGS = {"searxng": "http://h:1", "max_results": 10, "timeout_s": 15.0, "max_uses": 8, "nested_prompt": True}
 
 
 class FakeSearxng:
@@ -176,6 +179,26 @@ class ServerTool(unittest.TestCase):
         self.assertTrue(self.engine.prompts[0].endswith("<function=web_search>\n"))
         self.assertFalse(self.engine.prompts[1].endswith("<function=web_search>\n"))
 
+    def test_claude_code_search_prompt_replaced(self):
+        self.start()
+        code, text = self.post(stream=False, tool_choice={"type": "tool", "name": "web_search"},
+                               system=[{"type": "text", "text": "You are Claude Code."},
+                                       {"type": "text", "text": CLAUDE_CODE_PROMPT}],
+                               tools=[{**WEB_SEARCH, "max_uses": 3}])
+        self.assertEqual(code, 200, text)
+        first = self.engine.prompts[0]
+        self.assertIn(websearch.NESTED_PROMPT.format(uses=3), first)
+        self.assertIn("You are Claude Code.", first)
+        self.assertNotIn("Search once", first)
+
+    def test_claude_code_search_prompt_kept_when_off(self):
+        self.start()
+        self.svc.web_search = {**self.svc.web_search, "nested_prompt": False}
+        code, text = self.post(stream=False, system=CLAUDE_CODE_PROMPT)
+        self.assertEqual(code, 200, text)
+        self.assertIn(CLAUDE_CODE_PROMPT, self.engine.prompts[0])
+        self.assertNotIn("Search at most", self.engine.prompts[0])
+
     def test_max_uses(self):
         self.start(searches=3)
         code, text = self.post(stream=False, tools=[{**WEB_SEARCH, "max_uses": 1}])
@@ -240,13 +263,40 @@ class History(unittest.TestCase):
         self.assertEqual(messages[-1], {"role": "tool", "content": "error: max_uses_exceeded"})
 
 
+class NestedPrompt(unittest.TestCase):
+    def test_string_system(self):
+        req = {"system": "x " + CLAUDE_CODE_PROMPT, "tools": [WEB_SEARCH], "messages": []}
+        out = websearch.nested_prompt(req, SETTINGS)
+        self.assertEqual(out["system"], websearch.NESTED_PROMPT.format(uses=8))
+        self.assertEqual(req["system"], "x " + CLAUDE_CODE_PROMPT)
+
+    def test_untouched(self):
+        cases = ({"system": CLAUDE_CODE_PROMPT, "messages": []},
+                 {"system": "You are a helpful assistant.", "tools": [WEB_SEARCH], "messages": []},
+                 {"system": [{"type": "text", "text": "You are Claude Code."}], "tools": [WEB_SEARCH]},
+                 {"tools": [WEB_SEARCH], "messages": []})
+        for req in cases:
+            with self.subTest(req=req):
+                self.assertIs(websearch.nested_prompt(req, SETTINGS), req)
+        req = {"system": CLAUDE_CODE_PROMPT, "tools": [WEB_SEARCH]}
+        self.assertIs(websearch.nested_prompt(req, {**SETTINGS, "nested_prompt": False}), req)
+
+    def test_uses_follow_the_lower_limit(self):
+        req = {"system": CLAUDE_CODE_PROMPT, "tools": [{**WEB_SEARCH, "max_uses": 20}]}
+        self.assertIn("at most 4 times", websearch.nested_prompt(req, {**SETTINGS, "max_uses": 4})["system"])
+
+
 class Config(unittest.TestCase):
     def test_settings(self):
         self.assertIsNone(websearch.settings_from({}))
         s = websearch.settings_from({"web_search": {"searxng": "http://h:1/", "timeout_s": 5}})
-        self.assertEqual(s, {"searxng": "http://h:1", "max_results": 10, "timeout_s": 5.0, "max_uses": 8})
+        self.assertEqual(s, {"searxng": "http://h:1", "max_results": 10, "timeout_s": 5.0, "max_uses": 8,
+                             "nested_prompt": True})
+        off = websearch.settings_from({"web_search": {"searxng": "http://h", "nested_prompt": False}})
+        self.assertFalse(off["nested_prompt"])
         for bad in ({"searxng": ""}, {}, "http://h", {"searxng": "http://h", "max_results": 0},
-                    {"searxng": "http://h", "max_uses": 1.5}, {"searxng": "http://h", "timeout_s": -1}):
+                    {"searxng": "http://h", "max_uses": 1.5}, {"searxng": "http://h", "timeout_s": -1},
+                    {"searxng": "http://h", "nested_prompt": "yes"}):
             with self.subTest(block=bad), self.assertRaises(SystemExit):
                 websearch.settings_from({"web_search": bad})
 
