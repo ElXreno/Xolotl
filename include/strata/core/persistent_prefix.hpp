@@ -282,9 +282,7 @@ public:
         const uint64_t n = payload.size();
         return enqueue_file(std::move(identity), std::move(cells), n,
             [data = std::move(payload)](const std::string& path, std::string&) {
-                std::ofstream out(path, std::ios::binary);
-                out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
-                out.close(); return bool(out);
+                return write_payload(path, data.data(), data.size());
             });
     }
     bool enqueue_reserved(std::string identity, std::vector<uint64_t> cells, std::vector<uint8_t> payload,
@@ -293,8 +291,7 @@ public:
         std::vector<std::vector<uint64_t>> keys; keys.push_back(std::move(cells));
         return enqueue_file_keys_reserved(std::move(identity),std::move(keys),n,
             [data=std::move(payload)](const std::string& path,std::string&) {
-                std::ofstream out(path,std::ios::binary);
-                out.write(reinterpret_cast<const char*>(data.data()),data.size()); out.close(); return bool(out);
+                return write_payload(path, data.data(), data.size());
             },std::move(reservation),std::move(capture));
     }
     bool enqueue_file(std::string identity, std::vector<uint64_t> cells, uint64_t expected_bytes, Writer writer) {
@@ -392,14 +389,11 @@ public:
         Record r; r.cells = std::move(file->cells); r.reservation = reserve(n);
         if (!r.reservation) return {};
         try { r.payload.resize(static_cast<size_t>(n)); } catch (...) { return {}; }
-        std::ifstream in(file->path, std::ios::binary);
         size_t offset = 0;
-        while (offset < r.payload.size()) {
-            if (cancel && cancel()) return {};
-            const size_t chunk = std::min<size_t>(1 << 20, r.payload.size() - offset);
-            if (!in.read(reinterpret_cast<char*>(r.payload.data() + offset), chunk)) return {};
-            offset += chunk;
-        }
+        if (!read_file(file->path, [&](const char* data, size_t got) {
+                if ((cancel && cancel()) || got > r.payload.size() - offset) return false;
+                std::memcpy(r.payload.data() + offset, data, got); offset += got; return true;
+            }) || offset != r.payload.size()) return {};
         return r;
         } catch (...) { ++stats_.failures; return {}; }
     }
@@ -484,16 +478,79 @@ private:
         std::error_code ec;
         return fs::is_regular_file(fs::symlink_status(path, ec)) && !ec && fs::hard_link_count(path, ec) == 1 && !ec;
     }
-    static bool hash_file(const fs::path& path, uint64_t& bytes, uint64_t& hash, const std::function<bool()>& cancel = {}) {
-        if (!regular(path)) return false;
+    static constexpr size_t uncached_chunk = 8u << 20;
+    static bool write_payload(const std::string& path, const uint8_t* data, size_t n) {
+#if defined(__linux__)
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return false;
+        bool ok = true;
+        size_t done = 0, previous = 0, previous_len = 0;
+        auto settle = [&](size_t at, size_t len) {
+            if (!len) return;
+            if (::sync_file_range(fd, static_cast<off_t>(at), static_cast<off_t>(len),
+                                  SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)) ok = false;
+            ::posix_fadvise(fd, static_cast<off_t>(at), static_cast<off_t>(len), POSIX_FADV_DONTNEED);
+        };
+        while (ok && done < n) {
+            const size_t len = std::min(uncached_chunk, n - done);
+            for (size_t put = 0; put < len;) {
+                const ssize_t w = ::write(fd, data + done + put, len - put);
+                if (w < 0) { if (errno == EINTR) continue; ok = false; break; }
+                put += static_cast<size_t>(w);
+            }
+            if (!ok) break;
+            ::sync_file_range(fd, static_cast<off_t>(done), static_cast<off_t>(len), SYNC_FILE_RANGE_WRITE);
+            settle(previous, previous_len);
+            previous = done; previous_len = len; done += len;
+        }
+        if (ok) settle(previous, previous_len);
+        if (::close(fd)) ok = false;
+        return ok;
+#else
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+        out.close(); return bool(out);
+#endif
+    }
+    static bool read_file(const fs::path& path, const std::function<bool(const char*, size_t)>& consume) {
+#if defined(__linux__)
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd < 0) return false;
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+        std::vector<char> buf(1 << 16);
+        bool ok = true;
+        size_t total = 0, dropped = 0;
+        while (true) {
+            const ssize_t got = ::read(fd, buf.data(), buf.size());
+            if (got < 0) { if (errno == EINTR) continue; ok = false; break; }
+            if (got == 0) break;
+            if (!consume(buf.data(), static_cast<size_t>(got))) { ok = false; break; }
+            total += static_cast<size_t>(got);
+            if (total - dropped >= uncached_chunk) {
+                ::posix_fadvise(fd, static_cast<off_t>(dropped), static_cast<off_t>(total - dropped), POSIX_FADV_DONTNEED);
+                dropped = total;
+            }
+        }
+        ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        ::close(fd);
+        return ok;
+#else
         std::ifstream in(path, std::ios::binary);
-        char buf[1 << 16]; bytes = 0; hash = 1469598103934665603ull;
+        char buf[1 << 16];
         while (in) {
-            if (cancel && cancel()) return false;
-            in.read(buf, sizeof(buf)); const auto n = in.gcount();
-            if (n > 0) { hash = hash_bytes(buf, n, hash); bytes += n; }
+            in.read(buf, sizeof(buf)); const auto got = in.gcount();
+            if (got > 0 && !consume(buf, static_cast<size_t>(got))) return false;
         }
         return in.eof();
+#endif
+    }
+    static bool hash_file(const fs::path& path, uint64_t& bytes, uint64_t& hash, const std::function<bool()>& cancel = {}) {
+        if (!regular(path)) return false;
+        bytes = 0; hash = 1469598103934665603ull;
+        return read_file(path, [&](const char* data, size_t got) {
+            if (cancel && cancel()) return false;
+            hash = hash_bytes(data, got, hash); bytes += got; return true;
+        });
     }
     static void u64(std::vector<uint8_t>& out, uint64_t n) {
         for (unsigned i = 0; i < 8; ++i) out.push_back(static_cast<uint8_t>(n >> (8 * i)));
