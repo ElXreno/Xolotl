@@ -274,6 +274,21 @@ inline uint64_t zfs_arc_reclaimable_bytes(const char** why = nullptr) {
     }
     std::fclose(f);
     if (seen != 7) { if (why) *why = "arcstats lacks size / c_min / *_evictable_* (not an OpenZFS 2.x layout)"; return 0; }
+    unsigned long long lru = 0;
+    bool has_lru = false;
+    if (std::FILE* a = std::fopen("/proc/spl/kstat/zfs/abdstats", "r")) {
+        while (std::fgets(line, sizeof line, a))
+            if (std::sscanf(line, "%63s %u %llu", name, &type, &v) == 3 && std::strcmp(name, "lru_bytes") == 0) {
+                lru = v;
+                has_lru = true;
+                break;
+            }
+        std::fclose(a);
+    }
+    if (has_lru) {
+        if (why) *why = size <= c_min + lru ? "the ARC beyond its page-cache LRU is at its floor c_min" : nullptr;
+        return size <= c_min + lru ? 0 : size - c_min - lru;
+    }
     if (why) *why = size <= c_min ? "the ARC is at its floor c_min" : nullptr;
     return size <= c_min ? 0 : std::min<uint64_t>(evictable, size - c_min);
 }
