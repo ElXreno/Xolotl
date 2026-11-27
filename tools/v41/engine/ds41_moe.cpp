@@ -863,6 +863,7 @@ struct Gpu {
     /// run_chunk_xdev (STRATA_WIDE_PROMPT): c_x / c_out are not allocated (null) and c_xq / c_scratch only on a call's
     /// first MMVQ launch - each either null or at c_tok tokens.  c_xq_ok: c_xq holds this call's activations.
     bool c_xq_ok = false;
+    size_t c_scratch_cap = 0;
     uint8_t* c_bounce[2] = {};
     /// layer read-ahead (STRATA_LAYER_RA, default on; layer_ra_start): a prompt layer's WHOLE file tier - every format
     /// class - read into the bounce halves when the layer's first class pass starts, so the reads run back to back
@@ -7284,6 +7285,16 @@ static bool layer_ra_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t*
     return true;
 }
 
+void gpu_ensure_scratch(Gpu& gp, int64_t entries, int64_t n_ff) {
+    const size_t need = strata::kernels::native_expert_scratch_bytes(entries, n_ff);
+    if (gp.c_scratch && gp.c_scratch_cap >= need) return;
+    if (gp.c_scratch) cudaFree(gp.c_scratch);
+    gp.c_scratch = nullptr;
+    gp.c_scratch_cap = 0;
+    ck(cudaMalloc(&gp.c_scratch, need), "c_scratch");
+    gp.c_scratch_cap = need;
+}
+
 // x_dev (run_chunk_xdev, a "wide" call): the n input rows are already on the card and the sums go to out_dev - no c_x,
 // no c_out, no pinned landing pad, and the MMVQ buffers only when a launch needs them (the MMQ path never does).
 // Same kernels on the same rows: the sums are the classic call's bits.
@@ -7312,12 +7323,13 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     if (n > gp.c_tok) {   // (re)allocate the DEVICE buffers for n tokens (release_chunk gives them back)
         for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_w, gp.c_out}) if (p) cudaFree(p);
         gp.c_x = gp.c_xq = gp.c_scratch = gp.c_out = nullptr;
+        gp.c_scratch_cap = 0;
         gp.c_tok = n;
         const int64_t ne = (int64_t) n * K;
         if (!wide) ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
         if (!wide) ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
-        if (!wide) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
+        if (!wide) gpu_ensure_scratch(gp, ne, im.g.n_ff);
         // c_dst + r0 is the MMQ down product's `ids`, and MMQ reads up to 127 ids past a run's last entry: for the run
         // ending at entry ne that read went past the allocation - an MMU fault ("chunk sync: an illegal memory access",
         // Xid 31 on a 2 MiB page boundary) whenever the driver had placed c_dst at the end of a mapped page.  c_tokv
@@ -7331,7 +7343,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         const int64_t T = gp.c_tok;
         if (!gp.c_x) ck(cudaMalloc(&gp.c_x, (size_t) T * (size_t) H * 4), "c_x");
         if (!gp.c_xq) ck(cudaMalloc(&gp.c_xq, (size_t) T * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");
-        if (!gp.c_scratch) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(T * K, im.g.n_ff)), "c_scratch");
+        gpu_ensure_scratch(gp, NE, im.g.n_ff);
         if (!gp.c_out) ck(cudaMalloc(&gp.c_out, (size_t) T * (size_t) H * 4), "c_out");
     }
     if (n > gp.c_pin_tok && !wide) {   // the PINNED landing pad persists across prompts (see Gpu::c_pin_tok)
@@ -7511,7 +7523,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     auto ensure_mmvq = [&]() {
         if (gp.c_xq_ok) return;
         if (!gp.c_xq) ck(cudaMalloc(&gp.c_xq, (size_t) gp.c_tok * xq_col), "c_xq");
-        if (!gp.c_scratch) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(gp.c_tok * K, im.g.n_ff)), "c_scratch");
+        gpu_ensure_scratch(gp, NE, im.g.n_ff);
         quantize_xq();
         gp.c_xq_ok = true;
     };
@@ -8769,6 +8781,7 @@ void Ds41MoeTier::release_chunk() {
     }
     if (gp.s_cp) cudaStreamDestroy(gp.s_cp);
     gp.c_x = gp.c_xq = gp.c_parts = gp.c_scratch = gp.c_ptr = gp.c_start = gp.c_ng = gp.c_dst = gp.c_tokv = nullptr;
+    gp.c_scratch_cap = 0;
     gp.c_w = gp.c_out = nullptr;
     gp.c_stage[0] = gp.c_stage[1] = nullptr;
     for (int i = 0; i < 2; ++i) gp.c_copied[i] = gp.c_used[i] = nullptr;
